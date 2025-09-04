@@ -18,7 +18,7 @@ class OpenAIHandler:
     
     def __init__(self):
         self.model = OPENAI_MODEL
-        # Use only the modern OpenAI client
+        # Use the newer OpenAI client syntax for version >=1.0.0
         self.client = openai.OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
         
         if self.client:

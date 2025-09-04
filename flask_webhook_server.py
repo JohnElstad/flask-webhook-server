@@ -7,12 +7,23 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from webhook_handlers import webhook_bp
 from datetime import datetime
+import logging
+from supabase_logger import setup_supabase_logging, shutdown_logging
 
 # Create Flask app
 app = Flask(__name__)
 
 # Enable CORS for webhook testing
 CORS(app)
+
+# Set up Supabase logging with async batching
+setup_supabase_logging(
+    table_name='server_logs',
+    log_level=logging.INFO,
+    include_console=True,
+    batch_size=20,  # Send logs in batches of 20
+    flush_interval=10.0  # Flush every 10 seconds
+)
 
 # Register blueprints
 app.register_blueprint(webhook_bp)
@@ -113,5 +124,13 @@ if __name__ == '__main__':
     print(f"Ping test: http://{host}:{port}/ping")
     print(f"Message batching enabled - messages processed after {os.getenv('MESSAGE_BATCH_WAIT_TIME', 30)} seconds of inactivity")
     print(f"OpenAI integration: {'Enabled' if os.getenv('OPENAI_API_KEY') else 'Disabled'}")
+    print(f"Async logging enabled - logs batched every 10 seconds or 20 logs")
     
-    app.run(host=host, port=port, debug=True)
+    try:
+        # For production, disable debug mode and use 0.0.0.0
+        debug_mode = os.environ.get('FLASK_ENV') == 'development'
+        app.run(host='0.0.0.0', port=port, debug=debug_mode)
+    except KeyboardInterrupt:
+        print("\nShutting down gracefully...")
+        shutdown_logging()
+        print("Server stopped")

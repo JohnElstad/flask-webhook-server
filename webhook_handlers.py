@@ -8,8 +8,15 @@ import requests
 from openai_handler import openai_handler
 from chat_processor import chat_processor
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+# Import the new logging functions
+from supabase_logger import (
+    info_with_context, 
+    error_with_context, 
+    warning_with_context,
+    debug_with_context
+)
+
+# Configure basic logging (will be overridden by main server)
 logger = logging.getLogger(__name__)
 
 # Get API credentials from environment variables
@@ -42,7 +49,11 @@ def mark_contact_processing(contact_id):
         with processing_lock:
             contacts_being_processed.add(contact_id)
     except Exception as e:
-        logger.error(f"Error marking contact {contact_id} as processing: {str(e)}")
+        error_with_context(
+            f"Error marking contact {contact_id} as processing: {str(e)}",
+            contact_id=contact_id,
+            operation="mark_contact_processing"
+        )
 
 def unmark_contact_processing(contact_id):
     """Mark a contact as no longer being processed"""
@@ -74,7 +85,11 @@ def cleanup_dead_threads():
             
             for contact_id in dead_contacts:
                 del background_threads[contact_id]
-                logger.info(f"Cleaned up dead background thread for contact {contact_id}")
+                info_with_context(
+            f"Cleaned up dead background thread for contact {contact_id}",
+            contact_id=contact_id,
+            operation="cleanup_dead_threads"
+        )
         
         # Get all threads
         all_threads = threading.enumerate()
@@ -85,7 +100,10 @@ def cleanup_dead_threads():
                 dead_threads.append(thread.name)
         
         if dead_threads:
-            logger.info(f"Found {len(dead_threads)} dead threads: {dead_threads}")
+            info_with_context(
+            f"Found {len(dead_threads)} dead threads: {dead_threads}",
+            operation="cleanup_dead_threads"
+        )
             
         return len(dead_threads)
         
@@ -202,6 +220,74 @@ def store_message_in_supabase(contact_id, message_data):
         logger.error(f"Error storing SMS message in Supabase: {str(e)}")
         return False
 
+def store_first_message_in_supabase(contact_id, first_message):
+    """
+    Store the first message from GHL custom field in Supabase (only once per contact)
+    """
+    try:
+        if not SUPABASE_URL or not SUPABASE_ANON_KEY:
+            logger.error("Supabase credentials not configured")
+            return False
+        
+        if not first_message or not first_message.strip():
+            logger.warning(f"No first message provided for contact {contact_id}")
+            return False
+        
+        # Check if first message already exists for this contact
+        messages_url = f"{SUPABASE_URL}/rest/v1/messages"
+        headers = {
+            'apikey': SUPABASE_ANON_KEY,
+            'Authorization': f'Bearer {SUPABASE_ANON_KEY}',
+            'Content-Type': 'application/json'
+        }
+        
+        # Query to check if first message already exists
+        params = {
+            'contact_id': f'eq.{contact_id}',
+            'message_type': f'eq.AI_RESPONSE',
+            'select': 'id,message_body'
+        }
+        
+        check_response = requests.get(messages_url, headers=headers, params=params, timeout=5)
+        
+        if check_response.status_code == 200:
+            existing_messages = check_response.json()
+            
+            # Check if the first message already exists
+            for msg in existing_messages:
+                if msg.get('message_body', '').strip() == first_message.strip():
+                    logger.info(f"First message already exists for contact {contact_id}, skipping storage")
+                    return True
+            
+            logger.info(f"First message not found for contact {contact_id}, storing it now")
+        else:
+            logger.warning(f"Could not check existing messages for contact {contact_id}: {check_response.status_code}")
+        
+        # Store the first message
+        current_time = datetime.utcnow().isoformat() + 'Z'
+        supabase_data = {
+            'contact_id': contact_id,
+            'message_body': first_message.strip(),
+            'message_type': 'AI_RESPONSE',
+            'created_at': current_time
+        }
+        
+        response = requests.post(messages_url, json=supabase_data, headers=headers, timeout=5)
+        
+        if response.status_code in [200, 201]:
+            logger.info(f"First message for contact {contact_id} stored in Supabase successfully")
+            return True
+        else:
+            logger.error(f"Failed to store first message in Supabase: {response.status_code} - {response.text}")
+            return False
+            
+    except requests.exceptions.Timeout:
+        logger.error(f"Timeout storing first message for contact {contact_id} in Supabase")
+        return False
+    except Exception as e:
+        logger.error(f"Error storing first message in Supabase: {str(e)}")
+        return False
+
 def store_openai_analysis_in_supabase(contact_id, message_body, analysis_result):
     """
     Store OpenAI analysis results in Supabase
@@ -281,6 +367,56 @@ def process_webhook_background(data):
                 import traceback
                 logger.error(f"Contact storage traceback: {traceback.format_exc()}")
                 contact_stored = False
+            
+            # Store first message from custom field if provided
+            first_message = data.get('first_message')
+            
+            # Check customData for first message FIRST (highest priority)
+            if not first_message:
+                custom_data = data.get('customData', {})
+                if isinstance(custom_data, dict):
+                    # Look for first_message specifically
+                    first_message = custom_data.get('first_message')
+                    if first_message:
+                        logger.info(f"Found first message in customData.first_message for {contact_id}")
+                    else:
+                        # Look for any field with 'first' and 'message' in the name
+                        for key, value in custom_data.items():
+                            if 'first' in key.lower() and 'message' in key.lower():
+                                first_message = value
+                                logger.info(f"Found first message in customData.{key} for {contact_id}")
+                                break
+            
+            # Check alternative message fields if first_message not found (lower priority)
+            if not first_message:
+                message_1 = data.get('Message 1')
+                message_2 = data.get('Message 2')
+                message_3 = data.get('Message 3')
+                
+                if message_1:
+                    logger.info(f"Message 1 content: {message_1[:100]}...")
+                if message_2:
+                    logger.info(f"Message 2 content: {message_2[:100]}...")
+                if message_3:
+                    logger.info(f"Message 3 content: {message_3[:100]}...")
+                
+                # Only use Message 1 as the first message (assuming it's the initial message)
+                first_message = message_1
+                if first_message:
+                    logger.info(f"Using Message 1 as first message for {contact_id}")
+            
+            if first_message:
+                try:
+                    logger.info(f"Attempting to store first message for {contact_id}")
+                    first_message_stored = store_first_message_in_supabase(contact_id, first_message)
+                    logger.info(f"First message storage completed for {contact_id}: {first_message_stored}")
+                except Exception as e:
+                    logger.error(f"First message storage failed for {contact_id}: {str(e)}")
+                    logger.error(f"Error type: {type(e).__name__}")
+                    import traceback
+                    logger.error(f"First message storage traceback: {traceback.format_exc()}")
+            else:
+                logger.info(f"No first message found in any field for contact {contact_id}")
             
             # Store message in Supabase with comprehensive error handling
             message_stored = False
@@ -378,6 +514,43 @@ def webhook():
                 
             logger.info(f"Webhook data keys: {list(data.keys()) if isinstance(data, dict) else 'Not a dict'}")
             
+            # Log first_message specifically for debugging
+            first_message = data.get('first_message')
+            if first_message:
+                logger.info(f"First message found in webhook: {first_message[:100]}...")
+            else:
+                logger.info("No first_message found in webhook data")
+                
+            # Check for alternative message fields
+            message_1 = data.get('Message 1')
+            message_2 = data.get('Message 2') 
+            message_3 = data.get('Message 3')
+            messages_combined = data.get('MessagesCombined')
+            
+            if message_1:
+                logger.info(f"Message 1 found: {message_1[:100]}...")
+            if message_2:
+                logger.info(f"Message 2 found: {message_2[:100]}...")
+            if message_3:
+                logger.info(f"Message 3 found: {message_3[:100]}...")
+            if messages_combined:
+                logger.info(f"MessagesCombined found: {messages_combined[:100]}...")
+                
+            # Log all custom data fields
+            custom_data = data.get('customData', {})
+            if custom_data:
+                logger.info(f"Custom data fields: {list(custom_data.keys())}")
+                # Check specifically for first_message in customData
+                first_message_in_custom = custom_data.get('first_message')
+                if first_message_in_custom:
+                    logger.info(f"Found first_message in customData: {str(first_message_in_custom)[:100]}...")
+                else:
+                    logger.info("No first_message found in customData")
+                # Log other relevant fields
+                for key, value in custom_data.items():
+                    if 'message' in key.lower() or 'first' in key.lower():
+                        logger.info(f"Custom field {key}: {str(value)[:100]}...")
+            
         except Exception as e:
             logger.error(f"Critical error parsing webhook data: {str(e)}")
             logger.error(f"Request data: {request.get_data()}")
@@ -463,7 +636,6 @@ def webhook():
             # Continue without background processing - don't fail the webhook
         
         # CRITICAL: Ensure immediate response by adding minimal delay to prevent race conditions
-        import time
         time.sleep(0.001)  # 1ms delay to ensure background thread is fully started
         
         # Return immediate response - this is critical for GHL

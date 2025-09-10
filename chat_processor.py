@@ -6,6 +6,7 @@ import os
 import threading
 import time
 from openai_handler import openai_handler
+from system_prompts import get_system_prompt
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -20,7 +21,7 @@ GHL_API_URL = 'https://services.leadconnectorhq.com/conversations/messages'
 GHL_API_VERSION = '2021-04-15'
 
 # Message batching configuration
-MESSAGE_BATCH_WAIT_TIME = int(os.getenv('MESSAGE_BATCH_WAIT_TIME', 30))  # seconds
+MESSAGE_BATCH_WAIT_TIME = int(os.getenv('MESSAGE_BATCH_WAIT_TIME', 5))  # seconds
 MESSAGE_BATCH_CHECK_INTERVAL = 5  # seconds - how often to check for batch completion
 
 class ChatProcessor:
@@ -37,10 +38,10 @@ class ChatProcessor:
         self.max_concurrent_batches = int(os.getenv('MAX_CONCURRENT_BATCHES', 50))
         self.cleanup_interval = int(os.getenv('CLEANUP_INTERVAL', 300))  # 5 minutes
         
-        # Start cleanup timer
-        self._start_cleanup_timer()
+        # Start cleanup timer (disabled to prevent blocking)
+        # self._start_cleanup_timer()
         
-        logger.info(f"ChatProcessor initialized with max {self.max_concurrent_batches} concurrent batches, cleanup every {self.cleanup_interval}s")
+        logger.info(f"ChatProcessor initialized with max {self.max_concurrent_batches} concurrent batches, cleanup disabled to prevent blocking")
     
     def _start_cleanup_timer(self):
         """Start a background timer to periodically clean up inactive batches."""
@@ -53,11 +54,83 @@ class ChatProcessor:
                     time.sleep(self.cleanup_interval)
                 except Exception as e:
                     logger.error(f"Error in cleanup task: {str(e)}")
-                    time.sleep(self.cleanup_interval) # Retry after an error
+                    # Shorter sleep on error to prevent long blocking
+                    time.sleep(30)
+                except KeyboardInterrupt:
+                    logger.info("Cleanup task interrupted, stopping...")
+                    break
 
-        cleanup_thread = threading.Thread(target=cleanup_task, daemon=True)
+        cleanup_thread = threading.Thread(target=cleanup_task, daemon=True, name="CleanupTask")
         cleanup_thread.start()
         logger.info(f"Cleanup timer started. Will run every {self.cleanup_interval} seconds.")
+    
+    def manual_cleanup(self):
+        """Manually run cleanup to remove completed threads and old batches"""
+        try:
+            logger.info("Running manual cleanup...")
+            self._cleanup_completed_threads()
+            logger.info("Manual cleanup completed")
+        except Exception as e:
+            logger.error(f"Error in manual cleanup: {str(e)}")
+    
+    def force_cleanup_stuck_locks(self):
+        """Force cleanup of stuck locks that might be causing deadlocks"""
+        try:
+            logger.info("Force cleaning up stuck locks...")
+            stuck_contacts = []
+            
+            # Check for stuck locks
+            for contact_id, lock in self.batch_locks.items():
+                try:
+                    # Try to acquire lock with very short timeout
+                    if lock.acquire(timeout=0.1):
+                        lock.release()
+                    else:
+                        stuck_contacts.append(contact_id)
+                except:
+                    stuck_contacts.append(contact_id)
+            
+            # Force cleanup stuck contacts
+            for contact_id in stuck_contacts:
+                try:
+                    logger.warning(f"Force cleaning stuck contact: {contact_id}")
+                    if contact_id in self.active_batches:
+                        del self.active_batches[contact_id]
+                    if contact_id in self.batch_threads:
+                        del self.batch_threads[contact_id]
+                    if contact_id in self.batch_locks:
+                        del self.batch_locks[contact_id]
+                except:
+                    pass
+            
+            logger.info(f"Force cleanup completed, removed {len(stuck_contacts)} stuck contacts")
+            return len(stuck_contacts)
+        except Exception as e:
+            logger.error(f"Error in force cleanup: {str(e)}")
+            return 0
+    
+    def force_cleanup_all_threads(self):
+        """Force cleanup all threads and batches - nuclear option"""
+        try:
+            logger.warning("FORCE CLEANUP: Removing all threads and batches")
+            
+            # Clear all batches
+            batch_count = len(self.active_batches)
+            self.active_batches.clear()
+            
+            # Clear all threads
+            thread_count = len(self.batch_threads)
+            self.batch_threads.clear()
+            
+            # Clear all locks
+            lock_count = len(self.batch_locks)
+            self.batch_locks.clear()
+            
+            logger.warning(f"FORCE CLEANUP completed: {batch_count} batches, {thread_count} threads, {lock_count} locks removed")
+            return batch_count + thread_count + lock_count
+        except Exception as e:
+            logger.error(f"Error in force cleanup all: {str(e)}")
+            return 0
     
     def _cleanup_completed_threads(self):
         """Remove completed threads and old batches"""
@@ -97,11 +170,15 @@ class ChatProcessor:
         Send message to GHL using their API
         """
         try:
+            thread_id = threading.current_thread().ident
+            logger.info(f"[GHL_SEND] Thread {thread_id} starting GHL send for contact {contact_id}")
+            
             if not GHL_API_KEY:
-                logger.error("GHL API key not configured")
+                logger.error(f"[GHL_SEND] Thread {thread_id} GHL API key not configured")
                 return False
             
             # Prepare the GHL API request
+            logger.info(f"[GHL_SEND] Thread {thread_id} preparing GHL API request for contact {contact_id}")
             ghl_data = {
                 "type": "SMS",
                 "contactId": contact_id,
@@ -116,24 +193,28 @@ class ChatProcessor:
             }
             
             # Send message to GHL with shorter timeout to prevent hanging
-            logger.info(f"Attempting to send message to GHL for contact {contact_id}")
+            logger.info(f"[GHL_SEND] Thread {thread_id} attempting to send message to GHL for contact {contact_id}")
             response = requests.post(GHL_API_URL, json=ghl_data, headers=headers, timeout=5)
+            logger.info(f"[GHL_SEND] Thread {thread_id} GHL API call completed for contact {contact_id}")
             
             if response.status_code in [200, 201]:
-                logger.info(f"Message sent to GHL successfully for contact {contact_id}")
+                logger.info(f"[GHL_SEND] Thread {thread_id} message sent to GHL successfully for contact {contact_id}")
                 return True
             else:
-                logger.error(f"Failed to send message to GHL: {response.status_code} - {response.text}")
+                logger.error(f"[GHL_SEND] Thread {thread_id} failed to send message to GHL: {response.status_code} - {response.text}")
                 return False
                 
         except requests.exceptions.Timeout:
-            logger.error(f"GHL API timeout for contact {contact_id} - request took longer than 5 seconds")
+            thread_id = threading.current_thread().ident
+            logger.error(f"[GHL_SEND] Thread {thread_id} GHL API timeout for contact {contact_id} - request took longer than 5 seconds")
             return False
         except requests.exceptions.ConnectionError:
-            logger.error(f"GHL API connection error for contact {contact_id} - network issue")
+            thread_id = threading.current_thread().ident
+            logger.error(f"[GHL_SEND] Thread {thread_id} GHL API connection error for contact {contact_id} - network issue")
             return False
         except Exception as e:
-            logger.error(f"Error sending message to GHL for contact {contact_id}: {str(e)}")
+            thread_id = threading.current_thread().ident
+            logger.error(f"[GHL_SEND] Thread {thread_id} error sending message to GHL for contact {contact_id}: {str(e)}")
             return False
 
     def get_batch_wait_time(self) -> int:
@@ -146,7 +227,7 @@ class ChatProcessor:
         MESSAGE_BATCH_WAIT_TIME = seconds
         logger.info(f"Message batch wait time updated to {seconds} seconds")
     
-    def start_message_batch(self, contact_id: str, message_body: str):
+    def start_message_batch(self, contact_id: str, message_body: str, sourceforai: str = None):
         """
         Start or extend a message batch for a contact
         """
@@ -174,7 +255,7 @@ class ChatProcessor:
                     time_elapsed = (current_time - batch_info['start_time']).total_seconds()
                     time_remaining = max(0, MESSAGE_BATCH_WAIT_TIME - time_elapsed)
                     
-                    logger.info(f"Extended batch for contact {contact_id}, now {batch_info['message_count']} messages (timer continues, {time_remaining:.1f}s remaining)")
+                    logger.info(f"Extended batch for {contact_id}: {batch_info['message_count']} messages ({time_remaining:.1f}s remaining)")
                 else:
                     # Start new batch
                     batch_info = {
@@ -183,12 +264,13 @@ class ChatProcessor:
                         'message_count': 1,
                         'messages': [message_body],
                         'batch_id': f"batch_{contact_id}_{int(current_time.timestamp())}",
-                        'timer_started': True
+                        'timer_started': True,
+                        'sourceforai': sourceforai
                     }
                     self.active_batches[contact_id] = batch_info
-                    logger.info(f"Started new batch for contact {contact_id} with {MESSAGE_BATCH_WAIT_TIME}s timer")
+                    logger.info(f"Started new batch for {contact_id}: '{message_body[:30]}...' ({MESSAGE_BATCH_WAIT_TIME}s timer)")
                     
-                    # Start batch timer in background - this timer will NOT be restarted
+                    # Start batch timer in background
                     self._start_batch_timer(contact_id, batch_info)
                 
             return True
@@ -204,47 +286,46 @@ class ChatProcessor:
         try:
             # Don't start multiple timers for the same contact
             if contact_id in self.batch_threads:
-                logger.info(f"Timer already running for contact {contact_id}, skipping duplicate timer")
+                logger.warning(f"Timer already running for {contact_id}, skipping duplicate")
                 return
             
             def batch_timer():
                 try:
-                    logger.info(f"Batch timer started for contact {contact_id}, waiting {MESSAGE_BATCH_WAIT_TIME} seconds")
-                    
                     # Wait for the full batch wait time
                     time.sleep(MESSAGE_BATCH_WAIT_TIME)
                     
-                    logger.info(f"Batch timer expired for contact {contact_id}, processing batch")
+                    logger.info(f"Batch timer expired for {contact_id}, processing batch")
                     
                     # Process the batch with timeout protection
                     try:
+                        start_time = time.time()
                         self._process_message_batch(contact_id, batch_info)
+                        processing_time = time.time() - start_time
+                        logger.info(f"Batch processed for {contact_id} in {processing_time:.2f}s")
+                            
                     except Exception as process_error:
-                        logger.error(f"Error in batch processing for contact {contact_id}: {str(process_error)}")
+                        logger.error(f"Batch processing error for {contact_id}: {str(process_error)}")
                         # Force cleanup on processing error
                         try:
                             if contact_id in self.active_batches:
                                 del self.active_batches[contact_id]
-                                logger.info(f"Emergency cleanup after processing error for contact {contact_id}")
-                        except Exception as cleanup_error:
-                            logger.error(f"Emergency cleanup failed for contact {contact_id}: {str(cleanup_error)}")
+                        except Exception:
+                            pass
                     
                 except Exception as e:
-                    logger.error(f"Error in batch timer for contact {contact_id}: {str(e)}")
+                    logger.error(f"Batch timer error for {contact_id}: {str(e)}")
                 finally:
                     # Clean up thread reference
                     try:
                         if contact_id in self.batch_threads:
                             del self.batch_threads[contact_id]
-                        logger.info(f"Batch timer completed for contact {contact_id}")
-                    except Exception as cleanup_error:
-                        logger.error(f"Error during timer cleanup for contact {contact_id}: {str(cleanup_error)}")
+                    except Exception:
+                        pass
             
             # Start timer thread
-            timer_thread = threading.Thread(target=batch_timer, daemon=True)
+            timer_thread = threading.Thread(target=batch_timer, daemon=True, name=f"BatchTimer-{contact_id}")
             timer_thread.start()
             self.batch_threads[contact_id] = timer_thread
-            logger.info(f"Started batch timer for contact {contact_id}, will process in {MESSAGE_BATCH_WAIT_TIME} seconds")
             
         except Exception as e:
             logger.error(f"Error starting batch timer for contact {contact_id}: {str(e)}")
@@ -254,94 +335,105 @@ class ChatProcessor:
         Process a complete message batch
         """
         try:
-            logger.info(f"Processing message batch for contact {contact_id}: {batch_info['message_count']} messages")
-            
-            # Add overall timeout protection for the entire batch processing
-            start_time = time.time()
-            max_processing_time = 30  # Maximum 30 seconds for entire batch processing
-            
             # Combine all messages in the batch
             combined_message = " ".join(batch_info['messages'])
-            logger.info(f"Combined message for contact {contact_id}: {combined_message[:100]}...")
+            logger.info(f"Processing batch for {contact_id}: '{combined_message[:50]}...' ({batch_info['message_count']} messages)")
             
-            # Get chat history for context
+            # Get chat history for context and format for OpenAI
             messages = self.get_chat_history(contact_id, limit=20)
+            previous_messages = messages if messages else []
+            sourceforai = batch_info.get('sourceforai')
+            openai_messages = self.format_messages_for_openai(previous_messages, combined_message, sourceforai)
             
-            if not messages:
-                logger.info(f"No previous messages found for contact {contact_id}")
-                previous_messages = []
-            else:
-                previous_messages = messages
-                logger.info(f"Found {len(previous_messages)} previous messages for context")
-            
-            # Format messages for OpenAI chat completions
-            openai_messages = self.format_messages_for_openai(previous_messages, combined_message)
-            
-            # Debug: Log the message structure being sent to OpenAI
-            logger.info(f"=== OpenAI Message Structure for Batch ===")
-            for i, msg in enumerate(openai_messages):
-                role = msg.get('role', 'unknown')
-                content = msg.get('content', '')[:100] + '...' if len(msg.get('content', '')) > 100 else msg.get('content', '')
-                logger.info(f"Message {i}: role='{role}', content='{content}'")
-            logger.info(f"=== End Message Structure ===")
-            
-            # Process with OpenAI using proper chat completions format
+            # Process with OpenAI
             if openai_handler.is_configured():
                 try:
-                    # Check timeout before OpenAI call
-                    if time.time() - start_time > max_processing_time:
-                        logger.error(f"Batch processing timeout for contact {contact_id} before OpenAI call")
-                        return
                     
-                    # Generate AI response using the formatted messages
-                    logger.info(f"Calling OpenAI for contact {contact_id} with {len(openai_messages)} messages")
+                    # Generate AI response
                     response_result = openai_handler.generate_chat_response(openai_messages)
-                    
-                    # Check timeout after OpenAI call
-                    if time.time() - start_time > max_processing_time:
-                        logger.error(f"Batch processing timeout for contact {contact_id} after OpenAI call")
-                        return
                     
                     if response_result.get('response'):
                         ai_response = response_result['response']
-                        logger.info(f"Generated AI response for contact {contact_id}: {ai_response[:100]}...")
+                        logger.info(f"AI response for {contact_id}: {ai_response[:50]}...")
                         
                         # Store the AI response in Supabase
                         try:
                             self.store_ai_response(contact_id, ai_response, response_result)
-                            logger.info(f"AI response stored successfully for contact {contact_id}")
+                            logger.info(f"AI response stored and sent for {contact_id}")
                         except Exception as e:
-                            logger.error(f"Failed to store AI response for contact {contact_id}: {str(e)}")
+                            logger.error(f"Failed to store AI response for {contact_id}: {str(e)}")
                     else:
-                        logger.error(f"Failed to generate AI response for contact {contact_id}")
+                        logger.error(f"Failed to generate AI response for {contact_id}")
                         
                 except Exception as e:
                     logger.error(f"OpenAI processing failed for contact {contact_id}: {str(e)}")
             else:
                 logger.warning("OpenAI not configured, skipping AI processing")
             
-            # Check final timeout
-            if time.time() - start_time > max_processing_time:
-                logger.error(f"Batch processing timeout for contact {contact_id} - forcing cleanup")
             
-            # Clean up the processed batch
+            # Clean up the processed batch (non-blocking)
+            thread_id = threading.current_thread().ident
+            logger.info(f"[PROCESS_CLEANUP] Thread {thread_id} starting cleanup for contact {contact_id}")
             try:
-                with self.batch_locks[contact_id]:
+                # Try to acquire lock with timeout to prevent deadlock
+                if contact_id in self.batch_locks:
+                    logger.info(f"[PROCESS_CLEANUP] Thread {thread_id} attempting to acquire lock for contact {contact_id}")
+                    lock_acquired = self.batch_locks[contact_id].acquire(timeout=1.0)
+                    if lock_acquired:
+                        logger.info(f"[PROCESS_CLEANUP] Thread {thread_id} lock acquired for contact {contact_id}")
+                        try:
+                            if contact_id in self.active_batches:
+                                del self.active_batches[contact_id]
+                                logger.info(f"[PROCESS_CLEANUP] Thread {thread_id} batch processed and cleaned up for contact {contact_id}")
+                        finally:
+                            self.batch_locks[contact_id].release()
+                            logger.info(f"[PROCESS_CLEANUP] Thread {thread_id} lock released for contact {contact_id}")
+                    else:
+                        # Lock timeout - force cleanup without lock
+                        logger.warning(f"[PROCESS_CLEANUP] Thread {thread_id} lock timeout for contact {contact_id}, forcing cleanup")
+                        if contact_id in self.active_batches:
+                            del self.active_batches[contact_id]
+                            logger.info(f"[PROCESS_CLEANUP] Thread {thread_id} batch force cleaned up for contact {contact_id}")
+                else:
+                    # No lock exists, just clean up
+                    logger.info(f"[PROCESS_CLEANUP] Thread {thread_id} no lock exists for contact {contact_id}, cleaning up directly")
                     if contact_id in self.active_batches:
                         del self.active_batches[contact_id]
-                        logger.info(f"Batch processed and cleaned up for contact {contact_id}")
+                        logger.info(f"[PROCESS_CLEANUP] Thread {thread_id} batch cleaned up for contact {contact_id} (no lock)")
             except Exception as cleanup_error:
-                logger.error(f"Error during batch cleanup for contact {contact_id}: {str(cleanup_error)}")
+                logger.error(f"[PROCESS_CLEANUP] Thread {thread_id} error during batch cleanup for contact {contact_id}: {str(cleanup_error)}")
+                # Force cleanup even on error
+                try:
+                    if contact_id in self.active_batches:
+                        del self.active_batches[contact_id]
+                        logger.info(f"[PROCESS_CLEANUP] Thread {thread_id} emergency batch cleanup for contact {contact_id}")
+                except:
+                    pass
                     
         except Exception as e:
             logger.error(f"Error processing message batch for contact {contact_id}: {str(e)}")
-            # Ensure cleanup happens even on error
+            # Ensure cleanup happens even on error (non-blocking)
             try:
                 if contact_id in self.active_batches:
                     del self.active_batches[contact_id]
                     logger.info(f"Emergency cleanup of failed batch for contact {contact_id}")
+                # Also clean up the lock if it exists
+                if contact_id in self.batch_locks:
+                    try:
+                        self.batch_locks[contact_id].release()
+                    except:
+                        pass
+                    del self.batch_locks[contact_id]
             except Exception as emergency_cleanup_error:
                 logger.error(f"Emergency cleanup failed for contact {contact_id}: {str(emergency_cleanup_error)}")
+                # Force cleanup even if there's an error
+                try:
+                    if contact_id in self.active_batches:
+                        del self.active_batches[contact_id]
+                    if contact_id in self.batch_locks:
+                        del self.batch_locks[contact_id]
+                except:
+                    pass
     
     def get_active_batches(self) -> Dict:
         """Get information about active message batches"""
@@ -427,105 +519,20 @@ class ChatProcessor:
             logger.error(f"Error retrieving chat history: {str(e)}")
             return []
     
-    def format_messages_for_openai(self, messages: List[Dict], new_message: str) -> List[Dict]:
+    def format_messages_for_openai(self, messages: List[Dict], new_message: str, sourceforai: str = None) -> List[Dict]:
         """
         Convert Supabase message history to OpenAI chat completions format
         Returns: [{"role": "system", "content": "..."}, {"role": "user", "content": "..."}, ...]
         """
         openai_messages = []
         
-        # Add system message
+        # Add system message based on sourceforai field
+        system_prompt = get_system_prompt(sourceforai)
+        logger.info(f"Using system prompt for sourceforai: {sourceforai or 'default'}")
+        
         system_message = {
             "role": "system",
-            "content": """You are an AI SMS assistant for FX Wells Gym. Your role is to run a friendly reactivation campaign for past leads who showed interest but never signed up. 
-            
-            Your goals are: 
-            1) Answer any questions about the raffle. 
-            2) Get them to respond GETFIT so they can be entered into the raffle. 
-            3) Once they respond GETFIT, transition interested leads into our 30-day for free intro offer. Answer any questions about the intro offer.
-
-        Rules:
-        - Tone: Casual, upbeat, human, like a personal trainer texting. Never pushy or salesy.
-        - Keep all messages under 2 sentences.
-        - Never use emojis.
-        - If they reply STOP, opt them out immediately. Let them know that they have been opted out of SMS.
-        - If they decline at any point, thank them warmly and end the conversation.
-        - Always read the conversation history and do not repeat offers already made.
-        - Never improvise new offers.
-        - Do not loop or repeat steps unnecessarily.
-        - The ONLY way someone can enter the raffle is by replying GETFIT in all caps. If they dont reply GETFIT in all caps, they are not entered into the raffle so you cannot say they are entered.
-
-        Conversation Flow:
-        1) Raffle Invitation:
-        They user has already been sent a text about the raffle. They just need to reply GETFIT in all caps to enter.
-
-        2) Answer any questions the user might have about the raffle, but if user replies GETFIT (and only GETFIT), then you can enter them into the raffle:
-        - Confirm entry: 'Awesome, you're entered! The winners will be announced on Oct 15.'
-        
-        3) If user says yes to raffle:
-        - Transition to intro offer: 'While you’re here, we’d love to give you 30 days FREE at our gym so you don’t have to wait until the raffle to start training. Want me to explain how you can get the free 30 day trial?'
-
-        4) If user says NO to raffle:
-        'No worries, [name]! If you ever want to stop by, we’ve got great intro deals anytime. Right now we have a 30 days for free promo you might be intersted in instead.'
-
-        5) If user says YES to intro offer:
-        'Perfect! To claim your free 30 days, come into our gym within the next 5 days and show the front desk that you entered the raffle. Just show them your phone with the GETFIT message on it and you're good to go! The gym is located at 11270 Pepper Rd, Hunt Valley, MD 21031'
-
-        6) If user says NO to intro offer:
-        'Got it. Thanks for chatting, and best of luck crushing your goals!'
-
-        7) If user hesitates or is unsure:
-        Answer any questions the user might have about the raffle or the intro offer. Then do your best to help them understand the offers and why they should take advantage of them.
-
-        Follow this flow strictly and keep all replies short, clear, and human.
-        
-        Raffle Details:
-        - The raffle is for the Hunt Valley location of the Under Armour Performance Center.
-        - 1 winner will be chosen for every 100 people that enter.
-        - The raffle winners will be randomly selected and notified via text.
-        - The raffle winners will be drawn on Oct 15th
-        - Once they respond GETFIT, they are entered into the raffle.
-        Intro Offer Details:
-        - Free 30 days at the gym
-        - Just need to show the front desk that you entered the raffle.
-        - They need to have sent the GETFIT message in the last 5 days or the offer is no longer valid.
-
-        Gym Details:
-        Hunt Valley location of the Under Armour Performance Center. 
-        11270 Pepper Rd, Hunt Valley, MD 21031
-        Website: https://underarmourperformancecenter.com/
-        Hours: 
-            
-            Monday	5:30 AM–9 PM
-            Tuesday	5:30 AM–9 PM
-            Wednesday	5:30 AM–9 PM
-            Thursday	5:30 AM–9 PM
-            Friday	5:30 AM–9 PM
-            Saturday	7 AM–6 PM
-            Sunday	9 AM–3 PM
-
-        Gym FAQ's to help answer any questions:
-            Amenities:
-            Cardio equipment, free weights, Olympic lifting platforms, turf areas for functional training, and specialty machines like Jacobs Ladder.
-            Group fitness classes are included with membership or day/week passes.
-            Locker rooms with showers, sauna, and steam room are available. Towels are provided at the front desk.
-            The gym is clean, spacious, and monitored for safety.
-
-            Guest policy:
-            Guests are welcome but must sign in, complete a waiver, and pay a guest fee.
-            Policies may limit the number of guest visits and require guest adherence to all rules.
-
-            Are there dress code or apparel requirements?
-            Proper athletic attire is required, including clean, non-marking shoes and covered torso. Full-coverage clothing is mandatory, and no revealing clothing is permitted.
-            At the Baltimore Global HQ, members are encouraged to wear Under Armour apparel but non-branded attire is allowed per most recent user reviews.
-
-            Is there an age restriction?
-            Only adults 18+ may use the main gym facilities, unless participating in specifically approved youth programs.
-
-            Are personal trainers available?
-            Only FX Studios-authorized trainers may provide personal training within the gym. Unauthorized training is prohibited.
-
-        """
+            "content": system_prompt
         }
 
         openai_messages.append(system_message)
@@ -598,14 +605,15 @@ class ChatProcessor:
                 
                 # Now send the AI response to GoHighLevel
                 try:
-                    logger.info(f"Sending AI response to GoHighLevel for contact {contact_id}")
+                    thread_id = threading.current_thread().ident
+                    logger.info(f"[STORE_GHL] Thread {thread_id} sending AI response to GoHighLevel for contact {contact_id}")
                     ghl_sent = self.send_message_to_ghl(contact_id, ai_response)
                     if ghl_sent:
-                        logger.info(f"AI response sent to GoHighLevel successfully for contact {contact_id}")
+                        logger.info(f"[STORE_GHL] Thread {thread_id} AI response sent to GoHighLevel successfully for contact {contact_id}")
                     else:
-                        logger.error(f"Failed to send AI response to GoHighLevel for contact {contact_id}")
+                        logger.error(f"[STORE_GHL] Thread {thread_id} failed to send AI response to GoHighLevel for contact {contact_id}")
                 except Exception as e:
-                    logger.error(f"Error sending AI response to GoHighLevel for contact {contact_id}: {str(e)}")
+                    logger.error(f"[STORE_GHL] Thread {thread_id} error sending AI response to GoHighLevel for contact {contact_id}: {str(e)}")
                 
                 return True
             else:

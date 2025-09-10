@@ -7,6 +7,7 @@ from datetime import datetime
 import requests
 from openai_handler import openai_handler
 from chat_processor import chat_processor
+from system_prompts import get_first_message
 
 # Import the new logging functions
 from supabase_logger import (
@@ -37,6 +38,11 @@ processing_lock = threading.Lock()
 # Track background threads to prevent accumulation
 background_threads = {}  # contact_id -> thread_info
 thread_tracking_lock = threading.Lock()
+
+# Message deduplication - track recent messages by hash to prevent duplicates
+recent_messages = {}  # contact_id -> {message_hash: timestamp}
+message_dedup_lock = threading.Lock()
+MESSAGE_DEDUP_WINDOW = 300  # 5 minutes in seconds
 
 def is_contact_being_processed(contact_id):
     """Check if a contact is currently being processed"""
@@ -70,6 +76,97 @@ def unmark_contact_processing(contact_id):
                 del background_threads[contact_id]
     except Exception as e:
         logger.error(f"Error cleaning up thread tracking for contact {contact_id}: {str(e)}")
+
+def is_duplicate_message(contact_id, message_body):
+    """
+    Check if this message is a duplicate based on content hash within time window
+    
+    Args:
+        contact_id (str): The contact ID
+        message_body (str): The message content to check
+        
+    Returns:
+        bool: True if this is a duplicate message, False otherwise
+    """
+    if not message_body or not message_body.strip():
+        return False
+    
+    import hashlib
+    import time
+    
+    try:
+        # Create hash of message content (normalized)
+        normalized_message = message_body.strip().lower()
+        message_hash = hashlib.md5(normalized_message.encode()).hexdigest()
+        current_time = time.time()
+        
+        with message_dedup_lock:
+            # Clean up old entries first
+            if contact_id in recent_messages:
+                # Remove messages older than the deduplication window
+                old_hashes = []
+                for msg_hash, timestamp in recent_messages[contact_id].items():
+                    if current_time - timestamp > MESSAGE_DEDUP_WINDOW:
+                        old_hashes.append(msg_hash)
+                
+                for old_hash in old_hashes:
+                    del recent_messages[contact_id][old_hash]
+                
+                # If no recent messages left, remove the contact entry
+                if not recent_messages[contact_id]:
+                    del recent_messages[contact_id]
+            
+            # Check if this message hash exists for this contact
+            if contact_id in recent_messages:
+                if message_hash in recent_messages[contact_id]:
+                    time_since_last = current_time - recent_messages[contact_id][message_hash]
+                    logger.warning(f"Duplicate message detected for contact {contact_id}: '{message_body[:50]}...' (last seen {time_since_last:.1f}s ago)")
+                    return True
+            
+            # Add this message to the tracking
+            if contact_id not in recent_messages:
+                recent_messages[contact_id] = {}
+            recent_messages[contact_id][message_hash] = current_time
+            
+            logger.debug(f"Message recorded for contact {contact_id}: hash {message_hash[:8]}...")
+            return False
+            
+    except Exception as e:
+        logger.error(f"Error checking for duplicate message: {str(e)}")
+        # On error, don't block the message - let it through
+        return False
+
+def clean_old_message_hashes():
+    """Clean up old message hashes to prevent memory growth"""
+    try:
+        import time
+        current_time = time.time()
+        
+        with message_dedup_lock:
+            contacts_to_remove = []
+            
+            for contact_id in list(recent_messages.keys()):
+                # Clean old messages for this contact
+                old_hashes = []
+                for msg_hash, timestamp in recent_messages[contact_id].items():
+                    if current_time - timestamp > MESSAGE_DEDUP_WINDOW:
+                        old_hashes.append(msg_hash)
+                
+                for old_hash in old_hashes:
+                    del recent_messages[contact_id][old_hash]
+                
+                # If no messages left, mark contact for removal
+                if not recent_messages[contact_id]:
+                    contacts_to_remove.append(contact_id)
+            
+            # Remove contacts with no recent messages
+            for contact_id in contacts_to_remove:
+                del recent_messages[contact_id]
+            
+            logger.debug(f"Message hash cleanup complete. Tracking {len(recent_messages)} contacts")
+            
+    except Exception as e:
+        logger.error(f"Error during message hash cleanup: {str(e)}")
 
 def cleanup_dead_threads():
     """Clean up any dead threads that might be causing issues"""
@@ -342,13 +439,8 @@ def process_webhook_background(data):
         contact_id = data.get('contact_id', 'unknown')
         message_data = data.get('message', {})
         
-        logger.info(f"=== BACKGROUND PROCESSING STARTED ===")
-        logger.info(f"Contact ID: {contact_id}")
-        logger.info(f"Data type: {type(data)}")
-        logger.info(f"Data keys: {list(data.keys()) if isinstance(data, dict) else 'Not a dict'}")
-        
         if contact_id and contact_id != 'unknown':
-            logger.info(f"Background processing webhook for contact ID: {contact_id}")
+            logger.info(f"Processing webhook for contact {contact_id}")
             
             # Mark contact as being processed (minimal lock time)
             try:
@@ -368,55 +460,39 @@ def process_webhook_background(data):
                 logger.error(f"Contact storage traceback: {traceback.format_exc()}")
                 contact_stored = False
             
-            # Store first message from custom field if provided
-            first_message = data.get('first_message')
-            
-            # Check customData for first message FIRST (highest priority)
-            if not first_message:
+            # Get first message from system prompts based on sourceforai
+            sourceforai = data.get('sourceforai')
+            if not sourceforai:
+                # Check customData for sourceforai
                 custom_data = data.get('customData', {})
                 if isinstance(custom_data, dict):
-                    # Look for first_message specifically
-                    first_message = custom_data.get('first_message')
-                    if first_message:
-                        logger.info(f"Found first message in customData.first_message for {contact_id}")
-                    else:
-                        # Look for any field with 'first' and 'message' in the name
-                        for key, value in custom_data.items():
-                            if 'first' in key.lower() and 'message' in key.lower():
-                                first_message = value
-                                logger.info(f"Found first message in customData.{key} for {contact_id}")
-                                break
+                    sourceforai = custom_data.get('sourceforai')
             
-            # Check alternative message fields if first_message not found (lower priority)
-            if not first_message:
-                message_1 = data.get('Message 1')
-                message_2 = data.get('Message 2')
-                message_3 = data.get('Message 3')
-                
-                if message_1:
-                    logger.info(f"Message 1 content: {message_1[:100]}...")
-                if message_2:
-                    logger.info(f"Message 2 content: {message_2[:100]}...")
-                if message_3:
-                    logger.info(f"Message 3 content: {message_3[:100]}...")
-                
-                # Only use Message 1 as the first message (assuming it's the initial message)
-                first_message = message_1
-                if first_message:
-                    logger.info(f"Using Message 1 as first message for {contact_id}")
+            # Extract contact name from webhook data
+            contact_name = data.get('first_name', '')
+            if not contact_name:
+                # Try alternative name fields
+                contact_name = data.get('name', '')
+                if not contact_name:
+                    # Try full_name and extract first name
+                    full_name = data.get('full_name', '')
+                    if full_name:
+                        contact_name = full_name.split()[0] if full_name.split() else ''
             
-            if first_message:
-                try:
-                    logger.info(f"Attempting to store first message for {contact_id}")
-                    first_message_stored = store_first_message_in_supabase(contact_id, first_message)
-                    logger.info(f"First message storage completed for {contact_id}: {first_message_stored}")
-                except Exception as e:
-                    logger.error(f"First message storage failed for {contact_id}: {str(e)}")
-                    logger.error(f"Error type: {type(e).__name__}")
-                    import traceback
-                    logger.error(f"First message storage traceback: {traceback.format_exc()}")
-            else:
-                logger.info(f"No first message found in any field for contact {contact_id}")
+            # Get the appropriate first message based on sourceforai and contact name
+            first_message = get_first_message(sourceforai, contact_name)
+            logger.info(f"Using first message for sourceforai '{sourceforai or 'default'}' and contact '{contact_name or 'unknown'}': {first_message[:100]}...")
+            
+            # Store the first message in Supabase
+            try:
+                logger.info(f"Attempting to store first message for {contact_id}")
+                first_message_stored = store_first_message_in_supabase(contact_id, first_message)
+                logger.info(f"First message storage completed for {contact_id}: {first_message_stored}")
+            except Exception as e:
+                logger.error(f"First message storage failed for {contact_id}: {str(e)}")
+                logger.error(f"Error type: {type(e).__name__}")
+                import traceback
+                logger.error(f"First message storage traceback: {traceback.format_exc()}")
             
             # Store message in Supabase with comprehensive error handling
             message_stored = False
@@ -438,8 +514,24 @@ def process_webhook_background(data):
                     try:
                         logger.info(f"New SMS received for contact {contact_id}: {message_body[:50]}...")
                         
+                        # Check for duplicate messages before processing
+                        if is_duplicate_message(contact_id, message_body):
+                            logger.warning(f"Skipping duplicate message for contact {contact_id}: {message_body[:50]}...")
+                            return  # Skip processing this duplicate message
+                        
+                        # Periodically clean up old message hashes (every 10th message roughly)
+                        import random
+                        if random.randint(1, 10) == 1:
+                            try:
+                                clean_old_message_hashes()
+                            except Exception as cleanup_error:
+                                logger.error(f"Error during message hash cleanup: {str(cleanup_error)}")
+                        
+                        # Use sourceforai already extracted above
+                        logger.info(f"Using sourceforai: {sourceforai or 'default'} for contact {contact_id}")
+                        
                         # Start or extend message batch for AI processing
-                        chat_processor.start_message_batch(contact_id, message_body)
+                        chat_processor.start_message_batch(contact_id, message_body, sourceforai)
                         
                         logger.info(f"Message added to batch for contact {contact_id}")
                     except Exception as e:
@@ -492,64 +584,24 @@ def webhook():
     """
     # Add comprehensive error handling to prevent crashes
     try:
-        # Log the incoming webhook immediately
-        logger.info(f"=== WEBHOOK RECEIVED ===")
-        logger.info(f"Timestamp: {datetime.now()}")
-        logger.info(f"Method: {request.method}")
-        logger.info(f"Content-Type: {request.content_type}")
-        logger.info(f"Content-Length: {request.content_length}")
-        logger.info(f"Headers: {dict(request.headers)}")
-        
-        # Get the webhook data with comprehensive error handling
+        # Get the webhook data
         data = {}
         try:
             if request.is_json:
-                logger.info("Attempting to parse JSON webhook data...")
                 data = request.get_json()
-                logger.info(f"JSON webhook data parsed successfully: {type(data)}")
             else:
-                logger.info("Attempting to parse form webhook data...")
                 data = request.form.to_dict()
-                logger.info(f"Form webhook data parsed successfully: {type(data)}")
-                
-            logger.info(f"Webhook data keys: {list(data.keys()) if isinstance(data, dict) else 'Not a dict'}")
             
-            # Log first_message specifically for debugging
-            first_message = data.get('first_message')
-            if first_message:
-                logger.info(f"First message found in webhook: {first_message[:100]}...")
-            else:
-                logger.info("No first_message found in webhook data")
-                
-            # Check for alternative message fields
-            message_1 = data.get('Message 1')
-            message_2 = data.get('Message 2') 
-            message_3 = data.get('Message 3')
-            messages_combined = data.get('MessagesCombined')
+            # Extract key fields for logging
+            sourceforai = data.get('sourceforai')
+            if not sourceforai:
+                custom_data = data.get('customData', {})
+                if isinstance(custom_data, dict):
+                    sourceforai = custom_data.get('sourceforai')
             
-            if message_1:
-                logger.info(f"Message 1 found: {message_1[:100]}...")
-            if message_2:
-                logger.info(f"Message 2 found: {message_2[:100]}...")
-            if message_3:
-                logger.info(f"Message 3 found: {message_3[:100]}...")
-            if messages_combined:
-                logger.info(f"MessagesCombined found: {messages_combined[:100]}...")
-                
-            # Log all custom data fields
-            custom_data = data.get('customData', {})
-            if custom_data:
-                logger.info(f"Custom data fields: {list(custom_data.keys())}")
-                # Check specifically for first_message in customData
-                first_message_in_custom = custom_data.get('first_message')
-                if first_message_in_custom:
-                    logger.info(f"Found first_message in customData: {str(first_message_in_custom)[:100]}...")
-                else:
-                    logger.info("No first_message found in customData")
-                # Log other relevant fields
-                for key, value in custom_data.items():
-                    if 'message' in key.lower() or 'first' in key.lower():
-                        logger.info(f"Custom field {key}: {str(value)[:100]}...")
+            contact_name = data.get('first_name', '') or data.get('name', '') or (data.get('full_name', '').split()[0] if data.get('full_name') else '')
+            
+            logger.info(f"Webhook received - Source: {sourceforai or 'default'}, Contact: {contact_name or 'unknown'}")
             
         except Exception as e:
             logger.error(f"Critical error parsing webhook data: {str(e)}")

@@ -84,6 +84,75 @@ def reset_timers():
             'message': f'Request failed: {str(e)}'
         }), 500
 
+# Debug endpoint to check for stuck locks
+@app.route('/debug/locks', methods=['GET'])
+def debug_locks():
+    try:
+        from chat_processor import chat_processor
+        
+        # Get current status
+        active_batches = chat_processor.get_active_batches()
+        timer_status = chat_processor.get_timer_status()
+        
+        return jsonify({
+            'status': 'success',
+            'active_batches': active_batches,
+            'timer_status': timer_status,
+            'batch_locks_count': len(chat_processor.batch_locks),
+            'batch_threads_count': len(chat_processor.batch_threads),
+            'timestamp': datetime.now().isoformat()
+        }), 200
+        
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'message': f'Debug failed: {str(e)}'
+        }), 500
+
+# Force cleanup stuck locks endpoint
+@app.route('/debug/force-cleanup', methods=['POST'])
+def force_cleanup():
+    try:
+        from chat_processor import chat_processor
+        
+        # Force cleanup stuck locks
+        cleaned_count = chat_processor.force_cleanup_stuck_locks()
+        
+        return jsonify({
+            'status': 'success',
+            'message': f'Force cleanup completed, removed {cleaned_count} stuck contacts',
+            'cleaned_count': cleaned_count,
+            'timestamp': datetime.now().isoformat()
+        }), 200
+        
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'message': f'Force cleanup failed: {str(e)}'
+        }), 500
+
+# Nuclear cleanup endpoint - removes ALL threads and batches
+@app.route('/debug/nuclear-cleanup', methods=['POST'])
+def nuclear_cleanup():
+    try:
+        from chat_processor import chat_processor
+        
+        # Nuclear cleanup - removes everything
+        cleaned_count = chat_processor.force_cleanup_all_threads()
+        
+        return jsonify({
+            'status': 'success',
+            'message': f'Nuclear cleanup completed, removed {cleaned_count} items',
+            'cleaned_count': cleaned_count,
+            'timestamp': datetime.now().isoformat()
+        }), 200
+        
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'message': f'Nuclear cleanup failed: {str(e)}'
+        }), 500
+
 
 
 # Root endpoint
@@ -92,7 +161,7 @@ def root():
     return jsonify({
         'message': 'Webhook Server with OpenAI Integration',
         'features': {
-            'message_batching': f'Messages are batched and processed after {os.getenv("MESSAGE_BATCH_WAIT_TIME", 30)} seconds of inactivity',
+            'message_batching': f'Messages are batched and processed after {os.getenv("MESSAGE_BATCH_WAIT_TIME", 5)} seconds of inactivity',
             'openai_integration': 'AI-powered message analysis and responses',
             'chat_history': 'Automatic chat history retrieval and processing',
             'configurable_wait_time': 'Batch wait time is configurable via environment variable or API'
@@ -111,6 +180,23 @@ def root():
     })
 
 if __name__ == '__main__':
+    # Disable Windows console quick edit mode to prevent hanging
+    if os.name == 'nt':  # Windows only
+        try:
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            # Get console handle
+            console_handle = kernel32.GetStdHandle(-10)  # STD_INPUT_HANDLE
+            # Get current console mode
+            mode = ctypes.c_ulong()
+            kernel32.GetConsoleMode(console_handle, ctypes.byref(mode))
+            # Disable quick edit mode (0x0040) and insert mode (0x0020)
+            new_mode = mode.value & ~(0x0040 | 0x0020)
+            kernel32.SetConsoleMode(console_handle, new_mode)
+            print("Windows console quick edit mode disabled to prevent hanging")
+        except Exception as e:
+            print(f"Warning: Could not disable console quick edit mode: {e}")
+    
     # Get port from environment or default to 5000
     port = int(os.environ.get('PORT', 5000))
     
@@ -122,7 +208,7 @@ if __name__ == '__main__':
     print(f"Webhook endpoint: http://{host}:{port}/webhook")
     print(f"Health check: http://{host}:{port}/health")
     print(f"Ping test: http://{host}:{port}/ping")
-    print(f"Message batching enabled - messages processed after {os.getenv('MESSAGE_BATCH_WAIT_TIME', 30)} seconds of inactivity")
+    print(f"Message batching enabled - messages processed after {os.getenv('MESSAGE_BATCH_WAIT_TIME', 5)} seconds of inactivity")
     print(f"OpenAI integration: {'Enabled' if os.getenv('OPENAI_API_KEY') else 'Disabled'}")
     print(f"Async logging enabled - logs batched every 10 seconds or 20 logs")
     

@@ -5,10 +5,12 @@ A Flask-based webhook server designed to receive and process webhooks from GoHig
 ## Features
 
 - **Webhook Endpoint**: `/webhook` - Receives POST requests from external services
+- **Multi-Subaccount Support**: Handle multiple GHL subaccounts with automatic routing
 - **Message Batching**: Automatically batches incoming messages and processes them together for better AI context
 - **Configurable Wait Time**: Adjustable batch wait time (default: 30 seconds) via environment variable or API
 - **Health Check**: `/health` - Verify server status
 - **Test Endpoint**: `/test-webhook` - Test webhook functionality
+- **Subaccount Management API**: REST API for managing multiple GHL subaccounts
 - **Comprehensive Logging**: All webhook requests are logged for debugging
 - **Error Handling**: Robust error handling with detailed logging
 - **CORS Support**: Cross-origin requests enabled for testing
@@ -45,8 +47,12 @@ Edit `.env` with your configuration:
 - `HOST`: Server host (127.0.0.1 for local, 0.0.0.0 for production)
 - `PORT`: Server port (default: 5000)
 - `WEBHOOK_SECRET`: Secret key for webhook verification
-- `GHL_API_KEY`: Your GoHighLevel API key
-- `GHL_LOCATION_ID`: Your GHL location ID
+- `GHL_API_KEY`: Your GoHighLevel API key (default/fallback)
+- `GHL_LOCATION_ID`: Your GHL location ID (default/fallback)
+- `SUPABASE_URL`: Your Supabase project URL
+- `SUPABASE_ANON_KEY`: Your Supabase anon key
+
+**Note**: For multi-subaccount setup, see [MULTI_SUBACCOUNT_SETUP.md](MULTI_SUBACCOUNT_SETUP.md)
 
 ### 3. Run the Server
 

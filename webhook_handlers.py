@@ -8,6 +8,7 @@ import requests
 from openai_handler import openai_handler
 from chat_processor import chat_processor
 from system_prompts import get_first_message
+from subaccount_manager import subaccount_manager
 
 # Import the new logging functions
 from supabase_logger import (
@@ -208,9 +209,9 @@ def cleanup_dead_threads():
         logger.error(f"Error cleaning up dead threads: {str(e)}")
         return 0
 
-def store_contact_in_supabase(contact_data):
+def store_contact_in_supabase(contact_data, subaccount_id=None):
     """
-    Store contact information in Supabase
+    Store contact information in Supabase with subaccount support
     """
     try:
         if not SUPABASE_URL or not SUPABASE_ANON_KEY:
@@ -233,6 +234,7 @@ def store_contact_in_supabase(contact_data):
             'phone': phone,
             'email': email,
             'company_name': company_name,
+            'subaccount_id': subaccount_id,  # Add subaccount support
             'created_at': datetime.utcnow().isoformat() + 'Z',  # Use UTC time with Z suffix
             'updated_at': datetime.utcnow().isoformat() + 'Z'   # Use UTC time with Z suffix
         }
@@ -266,9 +268,9 @@ def store_contact_in_supabase(contact_data):
         logger.error(f"Error storing contact in Supabase: {str(e)}")
         return False
 
-def store_message_in_supabase(contact_id, message_data):
+def store_message_in_supabase(contact_id, message_data, subaccount_id=None):
     """
-    Store SMS message in Supabase
+    Store SMS message in Supabase with subaccount support
     """
     try:
         if not SUPABASE_URL or not SUPABASE_ANON_KEY:
@@ -289,6 +291,7 @@ def store_message_in_supabase(contact_id, message_data):
             'contact_id': contact_id,
             'message_body': message_body,
             'message_type': 'SMS',  # Always SMS
+            'subaccount_id': subaccount_id,  # Add subaccount support
             'created_at': current_time  # Use UTC time with Z suffix
         }
         
@@ -434,13 +437,18 @@ def process_webhook_background(data):
     Process webhook data in background thread with comprehensive error protection
     """
     contact_id = "unknown"
+    subaccount_id = None
     try:
         # Extract contact_id first for logging
         contact_id = data.get('contact_id', 'unknown')
         message_data = data.get('message', {})
         
+        # Extract subaccount ID from webhook data
+        subaccount_id = subaccount_manager.get_subaccount_from_webhook(data)
+        logger.info(f"Extracted subaccount ID: {subaccount_id or 'default'}")
+        
         if contact_id and contact_id != 'unknown':
-            logger.info(f"Processing webhook for contact {contact_id}")
+            logger.info(f"Processing webhook for contact {contact_id} (subaccount: {subaccount_id or 'default'})")
             
             # Mark contact as being processed (minimal lock time)
             try:
@@ -451,7 +459,7 @@ def process_webhook_background(data):
             # Store contact information in Supabase with comprehensive error handling
             try:
                 logger.info(f"Attempting to store contact for {contact_id}")
-                contact_stored = store_contact_in_supabase(data)
+                contact_stored = store_contact_in_supabase(data, subaccount_id)
                 logger.info(f"Contact storage completed for {contact_id}: {contact_stored}")
             except Exception as e:
                 logger.error(f"Contact storage failed for {contact_id}: {str(e)}")
@@ -499,7 +507,7 @@ def process_webhook_background(data):
             if message_data:
                 try:
                     logger.info(f"Attempting to store message for {contact_id}")
-                    message_stored = store_message_in_supabase(contact_id, message_data)
+                    message_stored = store_message_in_supabase(contact_id, message_data, subaccount_id)
                     logger.info(f"Message storage completed for {contact_id}: {message_stored}")
                 except Exception as e:
                     logger.error(f"Message storage failed for {contact_id}: {str(e)}")
@@ -530,8 +538,8 @@ def process_webhook_background(data):
                         # Use sourceforai already extracted above
                         logger.info(f"Using sourceforai: {sourceforai or 'default'} for contact {contact_id}")
                         
-                        # Start or extend message batch for AI processing
-                        chat_processor.start_message_batch(contact_id, message_body, sourceforai)
+                        # Start or extend message batch for AI processing (pass subaccount_id)
+                        chat_processor.start_message_batch(contact_id, message_body, sourceforai, subaccount_id)
                         
                         logger.info(f"Message added to batch for contact {contact_id}")
                     except Exception as e:

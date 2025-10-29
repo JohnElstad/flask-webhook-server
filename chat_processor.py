@@ -7,6 +7,7 @@ import threading
 import time
 from openai_handler import openai_handler
 from system_prompts import get_system_prompt
+from subaccount_manager import subaccount_manager
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -165,16 +166,27 @@ class ChatProcessor:
         except Exception as e:
             logger.error(f"Error during cleanup: {str(e)}")
         
-    def send_message_to_ghl(self, contact_id: str, message: str) -> bool:
+    def send_message_to_ghl(self, contact_id: str, message: str, subaccount_id: str = None) -> bool:
         """
-        Send message to GHL using their API
+        Send message to GHL using their API with subaccount support
         """
         try:
             thread_id = threading.current_thread().ident
-            logger.info(f"[GHL_SEND] Thread {thread_id} starting GHL send for contact {contact_id}")
+            logger.info(f"[GHL_SEND] Thread {thread_id} starting GHL send for contact {contact_id} (subaccount: {subaccount_id or 'default'})")
             
-            if not GHL_API_KEY:
-                logger.error(f"[GHL_SEND] Thread {thread_id} GHL API key not configured")
+            # Get credentials for the subaccount
+            credentials = None
+            if subaccount_id:
+                credentials = subaccount_manager.get_subaccount_credentials(subaccount_id)
+                if not credentials:
+                    logger.warning(f"[GHL_SEND] No credentials found for subaccount {subaccount_id}, falling back to default")
+            
+            # Fallback to default credentials if no subaccount or credentials not found
+            if not credentials:
+                credentials = subaccount_manager.get_default_subaccount()
+                
+            if not credentials:
+                logger.error(f"[GHL_SEND] Thread {thread_id} No GHL credentials available")
                 return False
             
             # Prepare the GHL API request
@@ -187,7 +199,7 @@ class ChatProcessor:
             
             headers = {
                 'Accept': 'application/json',
-                'Authorization': f'Bearer {GHL_API_KEY}',
+                'Authorization': f'Bearer {credentials["api_key"]}',
                 'Content-Type': 'application/json',
                 'Version': GHL_API_VERSION
             }
@@ -227,7 +239,7 @@ class ChatProcessor:
         MESSAGE_BATCH_WAIT_TIME = seconds
         logger.info(f"Message batch wait time updated to {seconds} seconds")
     
-    def start_message_batch(self, contact_id: str, message_body: str, sourceforai: str = None):
+    def start_message_batch(self, contact_id: str, message_body: str, sourceforai: str = None, subaccount_id: str = None):
         """
         Start or extend a message batch for a contact
         """
@@ -265,7 +277,8 @@ class ChatProcessor:
                         'messages': [message_body],
                         'batch_id': f"batch_{contact_id}_{int(current_time.timestamp())}",
                         'timer_started': True,
-                        'sourceforai': sourceforai
+                        'sourceforai': sourceforai,
+                        'subaccount_id': subaccount_id
                     }
                     self.active_batches[contact_id] = batch_info
                     logger.info(f"Started new batch for {contact_id}: '{message_body[:30]}...' ({MESSAGE_BATCH_WAIT_TIME}s timer)")
@@ -356,9 +369,10 @@ class ChatProcessor:
                         ai_response = response_result['response']
                         logger.info(f"AI response for {contact_id}: {ai_response[:50]}...")
                         
-                        # Store the AI response in Supabase
+                        # Store the AI response in Supabase (pass subaccount_id)
                         try:
-                            self.store_ai_response(contact_id, ai_response, response_result)
+                            subaccount_id = batch_info.get('subaccount_id')
+                            self.store_ai_response(contact_id, ai_response, response_result, subaccount_id)
                             logger.info(f"AI response stored and sent for {contact_id}")
                         except Exception as e:
                             logger.error(f"Failed to store AI response for {contact_id}: {str(e)}")
@@ -568,9 +582,9 @@ class ChatProcessor:
         logger.info(f"Formatted {len(openai_messages)} messages for OpenAI (including system message)")
         return openai_messages
     
-    def store_ai_response(self, contact_id: str, ai_response: str, response_metadata: Dict):
+    def store_ai_response(self, contact_id: str, ai_response: str, response_metadata: Dict, subaccount_id: str = None):
         """
-        Store AI response in Supabase
+        Store AI response in Supabase with subaccount support
         """
         try:
             if not SUPABASE_URL or not SUPABASE_ANON_KEY:
@@ -582,6 +596,7 @@ class ChatProcessor:
                 'contact_id': contact_id,
                 'message_body': ai_response,
                 'message_type': 'AI_RESPONSE',
+                'subaccount_id': subaccount_id,  # Add subaccount support
                 'created_at': datetime.utcnow().isoformat() + 'Z',  # Use UTC time with Z suffix
                 'metadata': {
                     'model': response_metadata.get('model', ''),
@@ -607,7 +622,7 @@ class ChatProcessor:
                 try:
                     thread_id = threading.current_thread().ident
                     logger.info(f"[STORE_GHL] Thread {thread_id} sending AI response to GoHighLevel for contact {contact_id}")
-                    ghl_sent = self.send_message_to_ghl(contact_id, ai_response)
+                    ghl_sent = self.send_message_to_ghl(contact_id, ai_response, subaccount_id)
                     if ghl_sent:
                         logger.info(f"[STORE_GHL] Thread {thread_id} AI response sent to GoHighLevel successfully for contact {contact_id}")
                     else:

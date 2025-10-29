@@ -6,6 +6,7 @@ load_dotenv()
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from webhook_handlers import webhook_bp
+from subaccount_api import subaccount_api_bp
 from datetime import datetime
 import logging
 from supabase_logger import setup_supabase_logging, shutdown_logging
@@ -27,6 +28,7 @@ setup_supabase_logging(
 
 # Register blueprints
 app.register_blueprint(webhook_bp)
+app.register_blueprint(subaccount_api_bp)
 
 # Health check endpoint
 @app.route('/health', methods=['GET'])

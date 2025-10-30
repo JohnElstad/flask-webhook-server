@@ -135,7 +135,8 @@ def test_subaccount_credentials(subaccount_id):
         test_url = f"{credentials['base_url']}/locations/{credentials['location_id']}"
         headers = {
             'Authorization': f'Bearer {credentials["api_key"]}',
-            'Content-Type': 'application/json'
+            'Content-Type': 'application/json',
+            'Version': '2021-07-28'
         }
         
         response = requests.get(test_url, headers=headers, timeout=10)

@@ -9,6 +9,7 @@ from openai_handler import openai_handler
 from chat_processor import chat_processor
 from system_prompts import get_first_message
 from subaccount_manager import subaccount_manager
+from bot_config_manager import bot_config_manager
 
 # Import the new logging functions
 from supabase_logger import (
@@ -444,6 +445,9 @@ def process_webhook_background(data):
         message_data = data.get('message', {})
         
         # Extract subaccount ID from webhook data
+        logger.info(f"DEBUG: Webhook data keys: {list(data.keys())}")
+        logger.info(f"DEBUG: location field content: {data.get('location')}")
+        logger.info(f"DEBUG: contact field content: {data.get('contact')}")
         subaccount_id = subaccount_manager.get_subaccount_from_webhook(data)
         logger.info(f"Extracted subaccount ID: {subaccount_id or 'default'}")
         
@@ -488,8 +492,33 @@ def process_webhook_background(data):
                         contact_name = full_name.split()[0] if full_name.split() else ''
             
             # Get the appropriate first message based on sourceforai and contact name
-            first_message = get_first_message(sourceforai, contact_name)
-            logger.info(f"Using first message for sourceforai '{sourceforai or 'default'}' and contact '{contact_name or 'unknown'}': {first_message[:100]}...")
+            # Try database first, then fall back to system_prompts.py
+            source_name = sourceforai or 'default'
+            logger.info(f"DEBUG BOT CONFIG: subaccount_id='{subaccount_id}', sourceforai='{sourceforai}', source_name='{source_name}', contact_name='{contact_name}'")
+            
+            # Get the actual subaccount_id for bot config lookup
+            bot_subaccount_id = subaccount_manager.get_subaccount_id(subaccount_id)
+            logger.info(f"DEBUG BOT CONFIG: Using bot_subaccount_id='{bot_subaccount_id}' for bot config lookup")
+            
+            # Pass the full webhook data for template variable substitution
+            contact_data = {
+                'first_name': data.get('first_name', ''),
+                'last_name': data.get('last_name', ''),
+                'full_name': data.get('full_name', ''),
+                'email': data.get('email', ''),
+                'phone': data.get('phone', '')
+            }
+            first_message = bot_config_manager.get_first_message(bot_subaccount_id, source_name, contact_name, contact_data)
+            logger.info(f"DEBUG BOT CONFIG: Database returned first_message='{first_message[:50] if first_message else 'None'}...'")
+            
+            # If no database config found, fall back to old system
+            if not first_message or first_message == f"Hello {contact_name}! How can I help you today?" or first_message == "Hello there! How can I help you today?":
+                first_message = get_first_message(sourceforai, contact_name)
+                logger.info(f"Using fallback first message from system_prompts.py for sourceforai '{sourceforai or 'default'}'")
+            else:
+                logger.info(f"Using database first message for subaccount '{subaccount_id}' source '{source_name}'")
+            
+            logger.info(f"Final first message for contact '{contact_name or 'unknown'}': {first_message[:100]}...")
             
             # Store the first message in Supabase
             try:

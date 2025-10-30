@@ -4,6 +4,9 @@ System Prompts Configuration
 This file contains all system prompts and first messages organized by sourceforai field values.
 Add new prompts and first messages here for different use cases by adding new entries to the dictionaries.
 
+DEPRECATED: Consider using the database-driven bot configuration system instead.
+See bot_config_manager.py for the new approach.
+
 Usage:
 - The key is the value of the 'sourceforai' field from the GoHighLevel webhook
 - SYSTEM_PROMPTS: The system prompt that will be used for that source

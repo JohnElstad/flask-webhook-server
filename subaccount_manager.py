@@ -35,10 +35,19 @@ class SubaccountManager:
         - customData.subaccountId
         """
         # Try common location ID fields
-        subaccount_id = webhook_data.get('locationId') or webhook_data.get('location_id')
+        subaccount_id = (webhook_data.get('locationId') or 
+                        webhook_data.get('location_id') or
+                        webhook_data.get('location'))
         
         if subaccount_id:
-            return subaccount_id
+            # If location is a dict, try to extract the ID
+            if isinstance(subaccount_id, dict):
+                subaccount_id = (subaccount_id.get('id') or 
+                               subaccount_id.get('locationId') or
+                               subaccount_id.get('location_id'))
+            
+            if subaccount_id:
+                return subaccount_id
             
         # Check customData
         custom_data = webhook_data.get('customData', {})
@@ -68,22 +77,37 @@ class SubaccountManager:
                     
         return subaccount_id
     
-    def get_subaccount_credentials(self, subaccount_id: str) -> Optional[Dict[str, str]]:
+    def get_subaccount_id(self, ghl_location_id: str) -> str:
         """
-        Get credentials for a specific subaccount
+        Get the actual subaccount_id from a GHL location ID
+        Returns the subaccount_id to use for bot configurations
+        """
+        logger.info(f"DEBUG SUBACCOUNT: Looking up subaccount_id for ghl_location_id='{ghl_location_id}'")
+        credentials = self._fetch_subaccount_from_db(ghl_location_id)
+        logger.info(f"DEBUG SUBACCOUNT: Database returned credentials: {credentials}")
+        if credentials and credentials.get('subaccount_id'):
+            result = credentials['subaccount_id']
+            logger.info(f"DEBUG SUBACCOUNT: Returning subaccount_id='{result}'")
+            return result
+        logger.info(f"DEBUG SUBACCOUNT: No credentials found, returning fallback='{ghl_location_id}'")
+        return ghl_location_id  # fallback to the original identifier
+
+    def get_subaccount_credentials(self, identifier: str) -> Optional[Dict[str, str]]:
+        """
+        Get credentials for a specific subaccount by subaccount_id OR ghl_location_id
         Returns dict with api_key, location_id, base_url
         """
-        # Check cache first
-        if self._is_cache_valid(subaccount_id):
-            return self.subaccount_cache.get(subaccount_id)
+        # Check cache first (use identifier as cache key)
+        if self._is_cache_valid(identifier):
+            return self.subaccount_cache.get(identifier)
             
         # Fetch from database
-        credentials = self._fetch_subaccount_from_db(subaccount_id)
+        credentials = self._fetch_subaccount_from_db(identifier)
         
         if credentials:
-            # Update cache
-            self.subaccount_cache[subaccount_id] = credentials
-            self.last_cache_update[subaccount_id] = datetime.now()
+            # Update cache (use identifier as cache key)
+            self.subaccount_cache[identifier] = credentials
+            self.last_cache_update[identifier] = datetime.now()
             
         return credentials
     
@@ -98,8 +122,8 @@ class SubaccountManager:
             
         return (datetime.now() - last_update).total_seconds() < self.cache_ttl
     
-    def _fetch_subaccount_from_db(self, subaccount_id: str) -> Optional[Dict[str, str]]:
-        """Fetch subaccount credentials from Supabase"""
+    def _fetch_subaccount_from_db(self, identifier: str) -> Optional[Dict[str, str]]:
+        """Fetch subaccount credentials from Supabase by subaccount_id OR ghl_location_id"""
         try:
             if not SUPABASE_URL or not SUPABASE_ANON_KEY:
                 logger.error("Supabase credentials not configured")
@@ -112,8 +136,9 @@ class SubaccountManager:
                 'Content-Type': 'application/json'
             }
             
+            # Try to find by subaccount_id first, then by ghl_location_id
             params = {
-                'subaccount_id': f'eq.{subaccount_id}',
+                'or': f'(subaccount_id.eq.{identifier},ghl_location_id.eq.{identifier})',
                 'is_active': 'eq.true',
                 'select': 'subaccount_id,ghl_api_key,ghl_location_id,ghl_base_url'
             }
@@ -125,9 +150,10 @@ class SubaccountManager:
                 if data and len(data) > 0:
                     subaccount = data[0]
                     return {
+                        'subaccount_id': subaccount['subaccount_id'],
                         'api_key': subaccount['ghl_api_key'],
                         'location_id': subaccount['ghl_location_id'],
-                        'base_url': subaccount.get('ghl_base_url', 'https://rest.gohighlevel.com/v1')
+                        'base_url': subaccount.get('ghl_base_url', 'https://services.leadconnectorhq.com')
                     }
                 else:
                     logger.warning(f"No active subaccount found for ID: {subaccount_id}")
@@ -147,7 +173,7 @@ class SubaccountManager:
         """
         api_key = os.getenv('GHL_API_KEY')
         location_id = os.getenv('GHL_LOCATION_ID')
-        base_url = os.getenv('GHL_BASE_URL', 'https://rest.gohighlevel.com/v1')
+        base_url = os.getenv('GHL_BASE_URL', 'https://services.leadconnectorhq.com')
         
         if api_key and location_id:
             return {
@@ -177,7 +203,7 @@ class SubaccountManager:
                 'subaccount_name': subaccount_name,
                 'ghl_api_key': api_key,
                 'ghl_location_id': location_id,
-                'ghl_base_url': base_url or 'https://rest.gohighlevel.com/v1',
+                'ghl_base_url': base_url or 'https://services.leadconnectorhq.com',
                 'is_active': True
             }
             

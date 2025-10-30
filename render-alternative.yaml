@@ -1,0 +1,38 @@
+# Alternative Render configuration with multiple startup options
+# Use this if the main render.yaml doesn't work
+
+services:
+  - type: web
+    name: flask-webhook-server-multi-subaccount
+    env: python
+    branch: feature/multi-subaccount  # Make sure this matches your branch
+    buildCommand: |
+      pip install --upgrade pip
+      pip install -r requirements.txt
+    # Try these start commands in order (use one at a time):
+    
+    # Option 1: Direct Python execution (recommended)
+    startCommand: python flask_webhook_server.py
+    
+    # Option 2: Using WSGI (uncomment if Option 1 fails)
+    # startCommand: python wsgi.py
+    
+    # Option 3: Using Gunicorn with wsgi.py (uncomment if Options 1-2 fail)
+    # startCommand: gunicorn wsgi:application --bind 0.0.0.0:$PORT --workers 2
+    
+    # Option 4: Using Gunicorn with flask_webhook_server (uncomment if others fail)
+    # startCommand: gunicorn flask_webhook_server:app --bind 0.0.0.0:$PORT --workers 2
+    
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.9.16
+      - key: FLASK_ENV
+        value: production
+      - key: HOST
+        value: 0.0.0.0
+      # Add your other environment variables here:
+      # - key: GHL_API_KEY
+      #   sync: false  # Set in Render dashboard for security
+      # - key: SUPABASE_URL
+      #   sync: false
+      # etc...

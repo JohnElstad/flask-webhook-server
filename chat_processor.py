@@ -8,6 +8,7 @@ import time
 from openai_handler import openai_handler
 from system_prompts import get_system_prompt
 from subaccount_manager import subaccount_manager
+from bot_config_manager import bot_config_manager
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -19,7 +20,7 @@ SUPABASE_ANON_KEY = os.getenv('SUPABASE_ANON_KEY')
 # GHL API configuration
 GHL_API_KEY = os.getenv('GHL_API_KEY')
 GHL_API_URL = 'https://services.leadconnectorhq.com/conversations/messages'
-GHL_API_VERSION = '2021-04-15'
+GHL_API_VERSION = '2021-07-28'
 
 # Message batching configuration
 MESSAGE_BATCH_WAIT_TIME = int(os.getenv('MESSAGE_BATCH_WAIT_TIME', 5))  # seconds
@@ -204,9 +205,12 @@ class ChatProcessor:
                 'Version': GHL_API_VERSION
             }
             
+            # Build the API URL using the subaccount's base URL
+            api_url = f"{credentials['base_url']}/conversations/messages"
+            
             # Send message to GHL with shorter timeout to prevent hanging
             logger.info(f"[GHL_SEND] Thread {thread_id} attempting to send message to GHL for contact {contact_id}")
-            response = requests.post(GHL_API_URL, json=ghl_data, headers=headers, timeout=5)
+            response = requests.post(api_url, json=ghl_data, headers=headers, timeout=5)
             logger.info(f"[GHL_SEND] Thread {thread_id} GHL API call completed for contact {contact_id}")
             
             if response.status_code in [200, 201]:
@@ -356,7 +360,8 @@ class ChatProcessor:
             messages = self.get_chat_history(contact_id, limit=20)
             previous_messages = messages if messages else []
             sourceforai = batch_info.get('sourceforai')
-            openai_messages = self.format_messages_for_openai(previous_messages, combined_message, sourceforai)
+            subaccount_id = batch_info.get('subaccount_id')
+            openai_messages = self.format_messages_for_openai(previous_messages, combined_message, sourceforai, subaccount_id)
             
             # Process with OpenAI
             if openai_handler.is_configured():
@@ -533,16 +538,33 @@ class ChatProcessor:
             logger.error(f"Error retrieving chat history: {str(e)}")
             return []
     
-    def format_messages_for_openai(self, messages: List[Dict], new_message: str, sourceforai: str = None) -> List[Dict]:
+    def format_messages_for_openai(self, messages: List[Dict], new_message: str, sourceforai: str = None, subaccount_id: str = None) -> List[Dict]:
         """
         Convert Supabase message history to OpenAI chat completions format
         Returns: [{"role": "system", "content": "..."}, {"role": "user", "content": "..."}, ...]
         """
         openai_messages = []
         
-        # Add system message based on sourceforai field
-        system_prompt = get_system_prompt(sourceforai)
-        logger.info(f"Using system prompt for sourceforai: {sourceforai or 'default'}")
+        # Add system message based on sourceforai field and subaccount
+        # Try database first, then fall back to system_prompts.py
+        source_name = sourceforai or 'default'
+        system_prompt = None
+        
+        if subaccount_id:
+            # Get the actual subaccount_id for bot config lookup
+            bot_subaccount_id = subaccount_manager.get_subaccount_id(subaccount_id)
+            system_prompt = bot_config_manager.get_system_prompt(bot_subaccount_id, source_name)
+            if system_prompt and system_prompt != "You are a helpful customer service assistant.":
+                logger.info(f"Using database system prompt for subaccount '{bot_subaccount_id}' source '{source_name}'")
+            else:
+                system_prompt = None
+        
+        # Fallback to old system if no database config found
+        if not system_prompt:
+            system_prompt = get_system_prompt(sourceforai)
+            logger.info(f"Using fallback system prompt from system_prompts.py for sourceforai: {sourceforai or 'default'}")
+        else:
+            logger.info(f"Using database system prompt for subaccount: {subaccount_id}")
         
         system_message = {
             "role": "system",

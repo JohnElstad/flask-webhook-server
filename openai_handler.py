@@ -48,7 +48,7 @@ class OpenAIHandler:
                 model=self.model,
                 messages=messages,
                 temperature=0.7,
-                max_tokens=100  # Reduced for shorter responses
+                max_tokens=350  # Reduced for shorter responses
             )
             
             ai_response = response.choices[0].message.content

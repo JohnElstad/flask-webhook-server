@@ -8,7 +8,7 @@ logger = logging.getLogger(__name__)
 
 # Get OpenAI configuration from environment variables
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
-OPENAI_MODEL = os.getenv('OPENAI_MODEL', 'gpt-4o-mini')  # Updated to gpt-4o-mini
+OPENAI_MODEL = os.getenv('OPENAI_MODEL', 'gpt-4o-mini')  # Default fallback, set OPENAI_MODEL env var for your model (e.g., 'gpt-5-mini')
 OPENAI_SYSTEM_PROMPT = os.getenv('OPENAI_SYSTEM_PROMPT', """You are a friendly SMS assistant for FX Wells Gym. Keep replies under 2 sentences and be helpful and professional.""")
 
 class OpenAIHandler:
@@ -42,14 +42,19 @@ class OpenAIHandler:
             }
         
         try:
-            logger.info(f"Generating chat response with {len(messages)} messages")
+            logger.info(f"Generating chat response with model '{self.model}' using {len(messages)} messages")
             
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                temperature=0.7,
-                max_completion_tokens=350  # Reduced for shorter responses
-            )
+            # Build API call parameters - GPT-5-mini and newer models require max_completion_tokens
+            # and don't support custom temperature (uses default of 1)
+            api_params = {
+                'model': self.model,
+                'messages': messages,
+                'max_completion_tokens': 350  # Required for GPT-5-mini and newer models
+            }
+            
+            logger.debug(f"API call parameters: model={self.model}, max_completion_tokens=350")
+            
+            response = self.client.chat.completions.create(**api_params)
             
             ai_response = response.choices[0].message.content
             logger.info(f"Generated AI response: {ai_response}")

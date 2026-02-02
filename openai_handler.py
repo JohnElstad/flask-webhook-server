@@ -46,13 +46,15 @@ class OpenAIHandler:
             
             # Build API call parameters - GPT-5-mini and newer models require max_completion_tokens
             # and don't support custom temperature (uses default of 1)
+            # Increased max_completion_tokens to prevent truncation issues
+            max_tokens = int(os.getenv('OPENAI_MAX_COMPLETION_TOKENS', '1000'))
             api_params = {
                 'model': self.model,
                 'messages': messages,
-                'max_completion_tokens': 350  # Required for GPT-5-mini and newer models
+                'max_completion_tokens': max_tokens  # Required for GPT-5-mini and newer models
             }
             
-            logger.debug(f"API call parameters: model={self.model}, max_completion_tokens=350")
+            logger.debug(f"API call parameters: model={self.model}, max_completion_tokens={max_tokens}")
             
             response = self.client.chat.completions.create(**api_params)
             
@@ -85,6 +87,9 @@ class OpenAIHandler:
             
             ai_response = choice.message.content
             
+            # Log raw content for debugging (before any processing)
+            logger.info(f"Raw response content (length: {len(ai_response) if ai_response else 0}): {repr(ai_response[:200])}")
+            
             # Check if content is None or empty
             if ai_response is None:
                 logger.error(f"Response content is None. Finish reason: {finish_reason}")
@@ -97,13 +102,22 @@ class OpenAIHandler:
                     'model': self.model
                 }
             
-            if not ai_response.strip():
-                logger.warning("Response content is empty string")
+            # Handle empty or whitespace-only content
+            if not ai_response or not ai_response.strip():
+                if finish_reason == 'length':
+                    logger.warning(f"Response was truncated (finish_reason=length) but content is empty. This may indicate the token limit is too restrictive.")
+                else:
+                    logger.warning(f"Response content is empty string. Finish reason: {finish_reason}")
                 return {
                     'response': 'I apologize, but I received an empty response from the AI.',
                     'error': 'Response content is empty',
+                    'finish_reason': finish_reason,
                     'model': self.model
                 }
+            
+            # Warn if response was truncated but still return it
+            if finish_reason == 'length':
+                logger.warning(f"Response was truncated due to max_completion_tokens limit. Consider increasing OPENAI_MAX_COMPLETION_TOKENS.")
             
             logger.info(f"Generated AI response: {ai_response[:100]}...")
             

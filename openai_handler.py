@@ -8,7 +8,7 @@ logger = logging.getLogger(__name__)
 
 # Get OpenAI configuration from environment variables
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
-OPENAI_MODEL = os.getenv('OPENAI_MODEL', 'gpt-4o-mini')  # Default fallback, set OPENAI_MODEL env var for your model (e.g., 'gpt-5-mini')
+OPENAI_MODEL = os.getenv('OPENAI_MODEL', 'gpt-4o-mini')  # Updated to gpt-4o-mini
 OPENAI_SYSTEM_PROMPT = os.getenv('OPENAI_SYSTEM_PROMPT', """You are a friendly SMS assistant for FX Wells Gym. Keep replies under 2 sentences and be helpful and professional.""")
 
 class OpenAIHandler:
@@ -44,80 +44,65 @@ class OpenAIHandler:
         try:
             logger.info(f"Generating chat response with model '{self.model}' using {len(messages)} messages")
             
-            # Build API call parameters - GPT-5-mini and newer models require max_completion_tokens
+            # Build API call parameters
+            # GPT-5-mini and newer models require max_completion_tokens (not max_tokens)
             # and don't support custom temperature (uses default of 1)
-            # Increased max_completion_tokens to prevent truncation issues
             max_tokens = int(os.getenv('OPENAI_MAX_COMPLETION_TOKENS', '1000'))
+            
+            # Store parameter: Controls whether conversations are stored for training/logging
+            # Set OPENAI_STORE_CONVERSATIONS=false to prevent storing (default: true)
+            store_conversations = os.getenv('OPENAI_STORE_CONVERSATIONS', 'true').lower() == 'true'
+            
             api_params = {
                 'model': self.model,
                 'messages': messages,
-                'max_completion_tokens': max_tokens  # Required for GPT-5-mini and newer models
+                'max_completion_tokens': max_tokens,  # Required for GPT-5-mini and newer models
+                'store': store_conversations  # Store conversations for logging/training
             }
             
-            logger.debug(f"API call parameters: model={self.model}, max_completion_tokens={max_tokens}")
+            logger.info(f"API call parameters: model={self.model}, max_completion_tokens={max_tokens}, store={store_conversations}")
+            
+            # Log full API call (excluding system prompt for readability)
+            messages_for_log = []
+            for msg in messages:
+                if msg.get('role') == 'system':
+                    messages_for_log.append({
+                        'role': 'system',
+                        'content': '[SYSTEM_PROMPT - excluded from log]'
+                    })
+                else:
+                    messages_for_log.append(msg)
+            logger.info(f"Full API call messages ({len(messages)} total): {messages_for_log}")
             
             response = self.client.chat.completions.create(**api_params)
             
-            # Log response structure for debugging
-            logger.info(f"Response received - choices count: {len(response.choices) if response.choices else 0}")
+            # Log full response
+            logger.info(f"Full OpenAI API response:")
+            logger.info(f"  - Request ID: {getattr(response, 'id', 'N/A')}")
+            logger.info(f"  - Model: {getattr(response, 'model', 'N/A')}")
+            logger.info(f"  - Choices count: {len(response.choices) if response.choices else 0}")
+            if response.choices:
+                for i, choice in enumerate(response.choices):
+                    finish_reason = getattr(choice, 'finish_reason', 'N/A')
+                    content = choice.message.content if choice.message else None
+                    content_preview = content[:200] + "..." if content and len(content) > 200 else content
+                    logger.info(f"  - Choice {i+1}: finish_reason={finish_reason}, content={repr(content_preview)}")
+            if hasattr(response, 'usage') and response.usage:
+                logger.info(f"  - Usage: prompt_tokens={response.usage.prompt_tokens}, completion_tokens={response.usage.completion_tokens}, total_tokens={response.usage.total_tokens}")
             
-            # Extract response content with better error handling
-            if not response.choices or len(response.choices) == 0:
-                logger.error("No choices in OpenAI response")
-                logger.error(f"Full response object: {response}")
+            # Log response ID for tracking in OpenAI dashboard
+            if hasattr(response, 'id'):
+                logger.info(f"OpenAI request ID: {response.id} (use this to find the request in your dashboard)")
+            
+            ai_response = response.choices[0].message.content
+            
+            if not ai_response:
+                logger.warning("Received empty response from OpenAI")
                 return {
                     'response': 'I apologize, but I received an empty response from the AI.',
-                    'error': 'No choices in response',
+                    'error': 'Empty response',
                     'model': self.model
                 }
-            
-            choice = response.choices[0]
-            finish_reason = getattr(choice, 'finish_reason', None)
-            logger.info(f"Choice finish_reason: {finish_reason}")
-            
-            # Check if message exists
-            if not choice.message:
-                logger.error(f"No message in choice. Full choice: {choice}")
-                return {
-                    'response': 'I apologize, but I received an empty response from the AI.',
-                    'error': 'No message in choice',
-                    'finish_reason': finish_reason,
-                    'model': self.model
-                }
-            
-            ai_response = choice.message.content
-            
-            # Log raw content for debugging (before any processing)
-            logger.info(f"Raw response content (length: {len(ai_response) if ai_response else 0}): {repr(ai_response[:200])}")
-            
-            # Check if content is None or empty
-            if ai_response is None:
-                logger.error(f"Response content is None. Finish reason: {finish_reason}")
-                logger.error(f"Choice message object: {choice.message}")
-                logger.error(f"Full choice object: {choice}")
-                return {
-                    'response': 'I apologize, but I received an empty response from the AI.',
-                    'error': 'Response content is None',
-                    'finish_reason': finish_reason,
-                    'model': self.model
-                }
-            
-            # Handle empty or whitespace-only content
-            if not ai_response or not ai_response.strip():
-                if finish_reason == 'length':
-                    logger.warning(f"Response was truncated (finish_reason=length) but content is empty. This may indicate the token limit is too restrictive.")
-                else:
-                    logger.warning(f"Response content is empty string. Finish reason: {finish_reason}")
-                return {
-                    'response': 'I apologize, but I received an empty response from the AI.',
-                    'error': 'Response content is empty',
-                    'finish_reason': finish_reason,
-                    'model': self.model
-                }
-            
-            # Warn if response was truncated but still return it
-            if finish_reason == 'length':
-                logger.warning(f"Response was truncated due to max_completion_tokens limit. Consider increasing OPENAI_MAX_COMPLETION_TOKENS.")
             
             logger.info(f"Generated AI response: {ai_response[:100]}...")
             
@@ -126,7 +111,7 @@ class OpenAIHandler:
                 'model': self.model,
                 'tokens_used': response.usage.total_tokens if response.usage else 0,
                 'messages_sent': len(messages),
-                'finish_reason': getattr(choice, 'finish_reason', None)
+                'request_id': getattr(response, 'id', None)
             }
             
         except Exception as e:

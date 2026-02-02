@@ -382,9 +382,7 @@ class ChatProcessor:
                         except Exception as e:
                             logger.error(f"Failed to store AI response for {contact_id}: {str(e)}")
                     else:
-                        error_msg = response_result.get('error', 'Unknown error')
-                        finish_reason = response_result.get('finish_reason', 'N/A')
-                        logger.error(f"Failed to generate AI response for {contact_id}. Error: {error_msg}, Finish reason: {finish_reason}, Full response: {response_result}")
+                        logger.error(f"Failed to generate AI response for {contact_id}")
                         
                 except Exception as e:
                     logger.error(f"OpenAI processing failed for contact {contact_id}: {str(e)}")
@@ -502,6 +500,7 @@ class ChatProcessor:
     def get_chat_history(self, contact_id: str, limit: int = 20) -> List[Dict]:
         """
         Retrieve chat history from Supabase for a specific contact
+        Returns the most recent messages in chronological order (oldest to newest)
         """
         try:
             if not SUPABASE_URL or not SUPABASE_ANON_KEY:
@@ -516,9 +515,10 @@ class ChatProcessor:
                 'Content-Type': 'application/json'
             }
             
+            # Get the MOST RECENT messages first (descending order)
             params = {
                 'contact_id': f'eq.{contact_id}',
-                'order': 'created_at.asc',  # Chronological order for conversation flow
+                'order': 'created_at.desc',  # Get newest first
                 'limit': limit
             }
             
@@ -527,7 +527,16 @@ class ChatProcessor:
             
             if response.status_code == 200:
                 messages = response.json()
-                logger.info(f"Retrieved {len(messages)} messages for contact {contact_id}")
+                # Reverse to get chronological order (oldest to newest) for OpenAI
+                messages.reverse()
+                logger.info(f"Retrieved {len(messages)} most recent messages for contact {contact_id}")
+                
+                # Log the timestamps of first and last messages for debugging
+                if messages:
+                    first_msg_time = messages[0].get('created_at', 'N/A')
+                    last_msg_time = messages[-1].get('created_at', 'N/A')
+                    logger.debug(f"Message time range: {first_msg_time} to {last_msg_time}")
+                
                 return messages
             else:
                 logger.error(f"Failed to retrieve chat history: {response.status_code} - {response.text}")
@@ -602,6 +611,15 @@ class ChatProcessor:
                 "role": "user",
                 "content": new_message
             })
+        
+        # Log the last few messages for debugging context issues
+        if len(openai_messages) > 1:
+            last_3_messages = openai_messages[-3:] if len(openai_messages) >= 3 else openai_messages[1:]
+            logger.info(f"Last {len(last_3_messages)} messages being sent to OpenAI:")
+            for i, msg in enumerate(last_3_messages, 1):
+                role = msg.get('role', 'unknown')
+                content_preview = msg.get('content', '')[:50]
+                logger.info(f"  {i}. [{role}]: {content_preview}...")
         
         logger.info(f"Formatted {len(openai_messages)} messages for OpenAI (including system message)")
         return openai_messages

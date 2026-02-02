@@ -56,14 +56,63 @@ class OpenAIHandler:
             
             response = self.client.chat.completions.create(**api_params)
             
-            ai_response = response.choices[0].message.content
-            logger.info(f"Generated AI response: {ai_response}")
+            # Log response structure for debugging
+            logger.info(f"Response received - choices count: {len(response.choices) if response.choices else 0}")
+            
+            # Extract response content with better error handling
+            if not response.choices or len(response.choices) == 0:
+                logger.error("No choices in OpenAI response")
+                logger.error(f"Full response object: {response}")
+                return {
+                    'response': 'I apologize, but I received an empty response from the AI.',
+                    'error': 'No choices in response',
+                    'model': self.model
+                }
+            
+            choice = response.choices[0]
+            finish_reason = getattr(choice, 'finish_reason', None)
+            logger.info(f"Choice finish_reason: {finish_reason}")
+            
+            # Check if message exists
+            if not choice.message:
+                logger.error(f"No message in choice. Full choice: {choice}")
+                return {
+                    'response': 'I apologize, but I received an empty response from the AI.',
+                    'error': 'No message in choice',
+                    'finish_reason': finish_reason,
+                    'model': self.model
+                }
+            
+            ai_response = choice.message.content
+            
+            # Check if content is None or empty
+            if ai_response is None:
+                logger.error(f"Response content is None. Finish reason: {finish_reason}")
+                logger.error(f"Choice message object: {choice.message}")
+                logger.error(f"Full choice object: {choice}")
+                return {
+                    'response': 'I apologize, but I received an empty response from the AI.',
+                    'error': 'Response content is None',
+                    'finish_reason': finish_reason,
+                    'model': self.model
+                }
+            
+            if not ai_response.strip():
+                logger.warning("Response content is empty string")
+                return {
+                    'response': 'I apologize, but I received an empty response from the AI.',
+                    'error': 'Response content is empty',
+                    'model': self.model
+                }
+            
+            logger.info(f"Generated AI response: {ai_response[:100]}...")
             
             return {
                 'response': ai_response,
                 'model': self.model,
                 'tokens_used': response.usage.total_tokens if response.usage else 0,
-                'messages_sent': len(messages)
+                'messages_sent': len(messages),
+                'finish_reason': getattr(choice, 'finish_reason', None)
             }
             
         except Exception as e:

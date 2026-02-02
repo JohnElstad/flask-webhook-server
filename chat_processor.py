@@ -382,7 +382,9 @@ class ChatProcessor:
                         except Exception as e:
                             logger.error(f"Failed to store AI response for {contact_id}: {str(e)}")
                     else:
-                        logger.error(f"Failed to generate AI response for {contact_id}")
+                        error_msg = response_result.get('error', 'Unknown error')
+                        finish_reason = response_result.get('finish_reason', 'N/A')
+                        logger.error(f"Failed to generate AI response for {contact_id}. Error: {error_msg}, Finish reason: {finish_reason}, Full response: {response_result}")
                         
                 except Exception as e:
                     logger.error(f"OpenAI processing failed for contact {contact_id}: {str(e)}")
